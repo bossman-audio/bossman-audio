@@ -307,8 +307,11 @@ class Window(Adw.ApplicationWindow):
         prev = core.current_default(objs)
         prev_id = core.resolve(objs, prev) if prev else None
 
-        core.set_default_sink(target)
+        # Volume first, then switch. The other order routes audio to a sink
+        # still sitting at its own remembered level, which is audible as a
+        # blip before the correction lands.
         carry_volume(prev_id, target)
+        core.set_default_sink(target)
         core.migrate_streams(target, name, objs)
         self.state["mode"] = key
         core.save_state(self.state)
@@ -401,8 +404,8 @@ class Window(Adw.ApplicationWindow):
                 raise RuntimeError("Device disappeared")
             prev = core.current_default(objs)
             prev_id = core.resolve(objs, prev) if prev else None
-            core.set_default_sink(nid)
             carry_volume(prev_id, nid)
+            core.set_default_sink(nid)
             core.migrate_streams(nid, name, objs)
             self.state["hw_sink"] = name
             self.state["mode"] = "pure"
