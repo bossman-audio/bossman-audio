@@ -36,6 +36,29 @@ except ImportError:
     print("error: hpctl2.py must be in the same directory", file=sys.stderr)
     sys.exit(1)
 
+try:
+    import hpctl3 as v3
+except ImportError:
+    print("error: hpctl3.py must be in the same directory", file=sys.stderr)
+    sys.exit(1)
+
+# v0.3 keeps one permanent sink and expresses mode as mixer gains, so the
+# questions this UI used to ask - which sink is default, does the EQ sink
+# exist - no longer describe reality. These helpers answer the equivalent
+# question against the new graph.
+
+def chain_present(objs):
+    return core.resolve(objs, v3.SINK) is not None
+
+
+def eq_controls(objs, index):
+    """Control names for one band. The EQ is per-side now, and shared by
+    both the direct and spatial paths."""
+    node = core.find_control_node(objs, f"eqL{index}:Gain")
+    if node is None:
+        return None, []
+    return node, [f"eqL{index}:Gain", f"eqR{index}:Gain"]
+
 
 # ---------------------------------------------------------------- heuristics
 
@@ -208,8 +231,8 @@ class Window(Adw.ApplicationWindow):
             return (
                 cur,
                 sinks,
-                core.resolve(objs, core.EQ_SINK) is not None,
-                core.resolve(objs, core.SPATIAL_SINK) is not None,
+                chain_present(objs),
+                chain_present(objs) and core.sofa_works(objs),
                 core.resolve(objs, cur) if cur else None,
             )
 
@@ -283,55 +306,49 @@ class Window(Adw.ApplicationWindow):
         self._run(lambda: self._switch(key))
 
     def _switch(self, key):
+        """
+        Hand the switch to v0.3.
+
+        The old path picked a sink per mode and moved the system default. That
+        is what made the desktop panel go stale and the volume jump, so none of
+        it survives: EQ and Spatial are now gain changes inside one permanent
+        sink, and only Pure moves the default. carry_volume is gone with it -
+        there is no longer a second sink to carry a level to.
+        """
         objs = core.pw_dump()
-        if key == "pure":
-            name = self.state.get("hw_sink")
-            if not name:
-                ranked = rank_sinks(core.list_sinks(objs))
-                if not ranked or ranked[0]["score"] < 0:
-                    raise RuntimeError("No suitable output found. "
-                                       "Pick one under Output Device.")
-                name = ranked[0]["name"]
-            target = core.resolve(objs, name)
-            if target is None:
-                raise RuntimeError(f"Device not present: {name}")
-        else:
-            self.state = core.remember_hw_sink(self.state, objs)
-            sink = core.EQ_SINK if key == "eq" else core.SPATIAL_SINK
-            target = core.resolve(objs, sink)
-            name = sink
-            if target is None:
-                raise RuntimeError(
-                    f"{key} sink not loaded — press Set Up below.")
+        if key != "pure" and not chain_present(objs):
+            raise RuntimeError("Audio chain not loaded — run "
+                               "'python3 hpctl3.py install' first.")
 
-        prev = core.current_default(objs)
-        prev_id = core.resolve(objs, prev) if prev else None
+        if key == "pure" and not self.state.get("hw_sink"):
+            ranked = rank_sinks(core.list_sinks(objs))
+            if not ranked or ranked[0]["score"] < 0:
+                raise RuntimeError("No suitable output found. "
+                                   "Pick one under Output Device.")
+            self.state["hw_sink"] = ranked[0]["name"]
+            core.save_state(self.state)
 
-        # Volume first, then switch. The other order routes audio to a sink
-        # still sitting at its own remembered level, which is audible as a
-        # blip before the correction lands.
-        carry_volume(prev_id, target)
-        core.set_default_sink(target)
-        core.migrate_streams(target, name, objs)
-        self.state["mode"] = key
-        core.save_state(self.state)
+        msg = v3.set_mode(key, makeup=self.state.get("makeup", 0.5))
+        self.state = core.load_state()
 
-        if key == "eq":
-            # Reality can drift from saved state: sliders moved while another
-            # mode was active were stored but never pushed, because the chain
-            # was not in the path. Re-push everything on entry so what the UI
-            # shows is what the filter is doing.
+        if key in ("eq", "spatial"):
+            # The EQ now sits after the mixer, so it applies in Spatial too.
+            # Re-push on entry because sliders moved while the chain was out
+            # of the path were saved but never sent.
             self._resync_eq()
 
-        return f"Switched to {key}"
+        return msg
 
     def _resync_eq(self):
         objs = core.pw_dump()
-        node = core.find_control_node(objs, "band_0:Gain")
+        node, _ = eq_controls(objs, 0)
         if node is None:
             return
-        for i, b in enumerate(self.state["bands"]):
-            core.push(node, f"band_{i}:Gain", b["gain"])
+        vals = {}
+        for i, b in enumerate(v3.bands_for(self.state)):
+            vals[f"eqL{i}:Gain"] = b["gain"]
+            vals[f"eqR{i}:Gain"] = b["gain"]
+        v3.push_many(node, vals)
 
     # ------------------------------------------------------------ status
 
@@ -422,7 +439,7 @@ class Window(Adw.ApplicationWindow):
                         "Spatial and Pure bypass it entirely.")
 
         self.eq_scales = []
-        for i, band in enumerate(self.state["bands"]):
+        for i, band in enumerate(v3.bands_for(self.state)):
             label = (f"{band['freq']} Hz" if band["freq"] < 1000
                      else f"{band['freq'] // 1000} kHz")
             row = Adw.ActionRow(title=label)
@@ -453,7 +470,7 @@ class Window(Adw.ApplicationWindow):
         if self._updating:
             return
         gain = round(scale.get_value(), 1)
-        self.state["bands"][idx]["gain"] = gain
+        v3.bands_for(self.state)[idx]["gain"] = gain
         core.save_state(self.state)
         # Debounced push: coalesce drag events so we are not hammering pw-cli.
         if getattr(self, "_eq_timer", None):
@@ -465,10 +482,10 @@ class Window(Adw.ApplicationWindow):
 
         def work():
             objs = core.pw_dump()
-            node = core.find_control_node(objs, f"band_{idx}:Gain")
+            node, names = eq_controls(objs, idx)
             if node is None:
                 return None  # chain not loaded; value is saved for later
-            core.push(node, f"band_{idx}:Gain", gain)
+            v3.push_many(node, {n: gain for n in names})
             return None
         threading.Thread(target=self._quiet, args=(work,), daemon=True).start()
         return False
@@ -477,16 +494,17 @@ class Window(Adw.ApplicationWindow):
         self._updating = True
         for i, s in enumerate(self.eq_scales):
             s.set_value(0)
-            self.state["bands"][i]["gain"] = 0.0
+            v3.bands_for(self.state)[i]["gain"] = 0.0
         self._updating = False
         core.save_state(self.state)
 
         def work():
             objs = core.pw_dump()
-            node = core.find_control_node(objs, "band_0:Gain")
+            node, _ = eq_controls(objs, 0)
             if node:
-                for i in range(len(self.state["bands"])):
-                    core.push(node, f"band_{i}:Gain", 0.0)
+                for i in range(len(v3.bands_for(self.state))):
+                    v3.push_many(node, {f"eqL{i}:Gain": 0.0,
+                                        f"eqR{i}:Gain": 0.0})
             return "Equaliser flat"
         self._run(work)
 
@@ -573,7 +591,7 @@ class Window(Adw.ApplicationWindow):
             objs = core.pw_dump()
             self.state = core.remember_hw_sink(self.state, objs)
             (core.CONF_DIR / f"{core.PREFIX}eq.conf").write_text(
-                core.eq_config(self.state["bands"]))
+                core.eq_config(v3.bands_for(self.state, "eq")))
             if sofa and os.path.exists(sofa):
                 (core.CONF_DIR / f"{core.PREFIX}spatial.conf").write_text(
                     core.spatial_config(sofa, makeup=makeup))
@@ -581,8 +599,8 @@ class Window(Adw.ApplicationWindow):
             core.restart_pipewire()
 
             objs = core.pw_dump()
-            ok_eq = core.resolve(objs, core.EQ_SINK) is not None
-            ok_sp = core.resolve(objs, core.SPATIAL_SINK) is not None
+            ok_eq = chain_present(objs)
+            ok_sp = ok_eq and core.sofa_works(objs)
             if not ok_eq:
                 raise RuntimeError("EQ chain failed to load — check "
                                    "journalctl --user -u pipewire")
@@ -619,8 +637,8 @@ class Window(Adw.ApplicationWindow):
             self.sinks = core.list_sinks(objs)
             caps = core.device_capabilities()
             sofa = core.sofa_works(objs)
-            eq_ok = core.resolve(objs, core.EQ_SINK) is not None
-            sp_ok = core.resolve(objs, core.SPATIAL_SINK) is not None
+            eq_ok = chain_present(objs)
+            sp_ok = eq_ok and core.sofa_works(objs)
             return ("refresh", cur, caps, sofa, eq_ok, sp_ok)
 
         def done(result):
@@ -628,11 +646,8 @@ class Window(Adw.ApplicationWindow):
             self._updating = True
 
             mode = self.state.get("mode", "pure")
-            if cur == core.EQ_SINK:
-                mode = "eq"
-            elif cur == core.SPATIAL_SINK:
-                mode = "spatial"
-            elif cur:
+            if cur and cur != v3.SINK:
+                # something outside this app moved the default away
                 mode = "pure"
             self.state["mode"] = mode
             if mode in self.mode_checks:
@@ -652,10 +667,10 @@ class Window(Adw.ApplicationWindow):
                 if s["name"] == cur:
                     pretty = s["desc"]
                     break
-            if cur == core.EQ_SINK:
-                pretty = "Headphones (EQ)"
-            elif cur == core.SPATIAL_SINK:
-                pretty = "Headphones (Spatial)"
+            if cur == v3.SINK:
+                # Both processed modes share one sink now, so the sink name no
+                # longer says which is active. The mode does.
+                pretty = f"Headphones ({'Spatial' if mode == 'spatial' else 'EQ'})"
             self.row_output.set_subtitle(pretty)
 
             hw = next((c for c in caps if c["rates"]), None)
