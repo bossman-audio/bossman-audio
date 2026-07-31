@@ -177,11 +177,23 @@ def rank_sinks(sinks):
 
 class Window(Adw.ApplicationWindow):
 
+    def _fresh(self):
+        """Reload state from disk. Call before any read-modify-write."""
+        self.state = core.load_state()
+        return self.state
+
+
     def __init__(self, app):
         super().__init__(application=app, title="Headphones",
                          default_width=520, default_height=760)
 
         self.state = core.load_state()
+        # The state file is shared with the CLI, and last night showed what
+        # happens when two processes each trust an in-memory copy: the GUI
+        # reasserted a mode the CLI had left minutes earlier, and every save
+        # clobbered the other side's changes. The file owns the truth. Reload
+        # before every read-modify-write; never act on state older than the
+        # user's click.
         self.sinks = []
         self.show_all_devices = False
         self._updating = False
@@ -214,7 +226,6 @@ class Window(Adw.ApplicationWindow):
         # panel, the top bar, another tool. Poll cheaply so the UI does not sit
         # there showing a mode the system left behind.
         self._last_seen = None
-        self._last_volume = None
         GLib.timeout_add_seconds(2, self._poll)
 
     def _poll(self):
@@ -228,35 +239,35 @@ class Window(Adw.ApplicationWindow):
             # vanishing leaves the UI showing something that is no longer true.
             sinks = tuple(sorted(s["name"] for s in core.list_sinks(objs)))
             cur = core.current_default(objs)
+            # An EQ<->Spatial switch changes nothing PipeWire-visible - no
+            # sink appears, no default moves; that invisibility is the whole
+            # point of the unified graph. The only artifact such a switch
+            # leaves is a write to the state file, so its mtime has to be
+            # part of the fingerprint or CLI switches go unnoticed until
+            # someone presses Refresh.
+            try:
+                state_mtime = core.STATE_FILE.stat().st_mtime_ns
+            except OSError:
+                state_mtime = 0
             return (
                 cur,
                 sinks,
                 chain_present(objs),
-                chain_present(objs) and core.sofa_works(objs),
+                chain_present(objs) and v3.spatial_ready(objs),
                 core.resolve(objs, cur) if cur else None,
+                state_mtime,
             )
 
         def done(fingerprint):
+            # This used to carry the last known volume onto whatever sink the
+            # system switched to - a third volume writer, acting on every
+            # default change including ones the CLI made deliberately. It ran
+            # unsuspected through all of last night's debugging. The rule that
+            # ended that night stands: switching never transfers volume. The
+            # poll watches and redraws; it does not write.
             if fingerprint != self._last_seen:
-                prev = self._last_seen[0] if self._last_seen else None
-                new = fingerprint[0]
-                # A switch made from GNOME's panel or the top bar never goes
-                # through our own code, so nothing carried the level over and
-                # the user gets a loudness jump. Apply the last known volume
-                # to whatever the system moved to.
-                if prev and new and prev != new and self._last_volume is not None:
-                    objs = core.pw_dump()
-                    nid = core.resolve(objs, new)
-                    if nid is not None:
-                        set_volume(nid, self._last_volume)
                 self._last_seen = fingerprint
                 self.refresh()
-            # Track the current level so the next switch has something to carry.
-            cur_id = fingerprint[4]
-            if cur_id is not None:
-                v = get_volume(cur_id)
-                if v is not None:
-                    self._last_volume = v
 
         threading.Thread(
             target=lambda: self._poll_thread(work, done), daemon=True).start()
@@ -315,6 +326,7 @@ class Window(Adw.ApplicationWindow):
         sink, and only Pure moves the default. carry_volume is gone with it -
         there is no longer a second sink to carry a level to.
         """
+        self._fresh()
         objs = core.pw_dump()
         if key != "pure" and not chain_present(objs):
             raise RuntimeError("Audio chain not loaded — run "
@@ -415,14 +427,19 @@ class Window(Adw.ApplicationWindow):
 
     def _on_pick_device(self, _btn, name):
         def work():
+            self._fresh()
             objs = core.pw_dump()
             nid = core.resolve(objs, name)
             if nid is None:
                 raise RuntimeError("Device disappeared")
             prev = core.current_default(objs)
             prev_id = core.resolve(objs, prev) if prev else None
+            # Mode switches never transfer volume - but this is a different
+            # physical device, and 100% tuned for headphones can be a blast
+            # on speakers. Carrying the level across a hardware change is
+            # protection, not the path-dependence we deleted yesterday.
             carry_volume(prev_id, nid)
-            core.set_default_sink(nid)
+            v3.set_default_both_layers(nid, name)
             core.migrate_streams(nid, name, objs)
             self.state["hw_sink"] = name
             self.state["mode"] = "pure"
@@ -435,8 +452,9 @@ class Window(Adw.ApplicationWindow):
     def _build_eq(self):
         self.eq_group = Adw.PreferencesGroup(
             title="Equaliser",
-            description="Applies in Custom EQ mode only. "
-                        "Spatial and Pure bypass it entirely.")
+            description="Separate curve per mode: what you shape here "
+                        "applies to the mode you are in. Pure bypasses "
+                        "the equaliser entirely.")
 
         self.eq_scales = []
         for i, band in enumerate(v3.bands_for(self.state)):
@@ -466,10 +484,28 @@ class Window(Adw.ApplicationWindow):
 
         self.page.add(self.eq_group)
 
+    def _sync_eq_sliders(self):
+        """
+        Point the sliders at the active mode's curve.
+
+        Curves are per-mode, but these widgets are built once at startup from
+        whichever curve was active then. Without a re-sync on mode change the
+        window shows one curve while edits land in another - flat sliders over
+        a +6dB band, which is how a boost nobody remembers setting stays
+        invisible until the CLI prints the truth.
+        """
+        self._updating = True
+        bands = v3.bands_for(self.state)
+        for i, scale in enumerate(self.eq_scales):
+            if i < len(bands):
+                scale.set_value(bands[i]["gain"])
+        self._updating = False
+
     def _on_band(self, scale, idx):
         if self._updating:
             return
         gain = round(scale.get_value(), 1)
+        self._fresh()
         v3.bands_for(self.state)[idx]["gain"] = gain
         core.save_state(self.state)
         # Debounced push: coalesce drag events so we are not hammering pw-cli.
@@ -491,10 +527,16 @@ class Window(Adw.ApplicationWindow):
         return False
 
     def _on_eq_reset(self, _btn):
+        # Reload once, then edit. Reloading inside the loop re-reads the old
+        # gains from disk on every pass, so each band's zeroing erased the
+        # previous one's and only the last survived the save - while PipeWire
+        # went flat, leaving file and filter silently disagreeing until the
+        # next mode switch re-pushed the stale curve.
         self._updating = True
+        bands = v3.bands_for(self._fresh())
         for i, s in enumerate(self.eq_scales):
             s.set_value(0)
-            v3.bands_for(self.state)[i]["gain"] = 0.0
+            bands[i]["gain"] = 0.0
         self._updating = False
         core.save_state(self.state)
 
@@ -575,14 +617,14 @@ class Window(Adw.ApplicationWindow):
             except GLib.Error:
                 return
             if f:
-                self.state["sofa"] = f.get_path()
+                self._fresh()["sofa"] = f.get_path()
                 core.save_state(self.state)
                 self.row_sofa.set_subtitle(f.get_path())
         dlg.open(self, None, done)
 
     def _on_apply(self, _btn):
         makeup = round(self.spatial_scale.get_value(), 2)
-        self.state["makeup"] = makeup
+        self._fresh()["makeup"] = makeup
         sofa = self.state.get("sofa")
         core.save_state(self.state)
 
@@ -600,7 +642,7 @@ class Window(Adw.ApplicationWindow):
 
             objs = core.pw_dump()
             ok_eq = chain_present(objs)
-            ok_sp = ok_eq and core.sofa_works(objs)
+            ok_sp = ok_eq and v3.spatial_ready(objs)
             if not ok_eq:
                 raise RuntimeError("EQ chain failed to load — check "
                                    "journalctl --user -u pipewire")
@@ -636,22 +678,25 @@ class Window(Adw.ApplicationWindow):
             cur = core.current_default(objs)
             self.sinks = core.list_sinks(objs)
             caps = core.device_capabilities()
-            sofa = core.sofa_works(objs)
+            sofa = v3.spatial_ready(objs)
             eq_ok = chain_present(objs)
-            sp_ok = eq_ok and core.sofa_works(objs)
+            sp_ok = eq_ok and v3.spatial_ready(objs)
             return ("refresh", cur, caps, sofa, eq_ok, sp_ok)
 
         def done(result):
             _, cur, caps, sofa, eq_ok, sp_ok = result
             self._updating = True
 
-            mode = self.state.get("mode", "pure")
+            # Trust the file, not memory: the CLI may have switched modes
+            # since this window last looked.
+            mode = self._fresh().get("mode", "pure")
             if cur and cur != v3.SINK:
                 # something outside this app moved the default away
                 mode = "pure"
             self.state["mode"] = mode
             if mode in self.mode_checks:
                 self.mode_checks[mode].set_active(True)
+            self._sync_eq_sliders()
 
             self.mode_rows["eq"].set_sensitive(eq_ok)
             self.mode_rows["spatial"].set_sensitive(sp_ok)

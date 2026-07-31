@@ -180,8 +180,8 @@ context.modules = [
   {{ name = libpipewire-module-filter-chain
     flags = [ nofail ]
     args = {{
-      node.description = "Headphones"
-      media.name       = "Headphones"
+      node.description = "Headphones (Processed)"
+      media.name       = "Headphones (Processed)"
       filter.graph = {{
         nodes = [
 {nl.join(nodes)}
@@ -349,10 +349,14 @@ def set_mode(mode, makeup=0.5, fade_ms=120, device=None):
         if nid is None:
             core.die(f"hardware sink '{hw}' not present")
         set_default_both_layers(nid, hw)
+        pure_level = st.get("pure_level")
+        if pure_level is not None:
+            set_volume(nid, pure_level)
         moved, how = core.migrate_streams(nid, hw, objs)
         st.pop("hw_volume_saved", None)   # legacy fold/restore residue
         st["mode"] = MODE_PURE
         core.save_state(st)
+        _notify(MODE_PURE)
         return f"pure -> {hw} ({moved} stream(s) moved via {how})"
 
     # make sure our sink is the default before an in-graph switch
@@ -368,11 +372,17 @@ def set_mode(mode, makeup=0.5, fade_ms=120, device=None):
     st.pop("hw_volume_saved", None)       # legacy fold/restore residue
     was = pin_hardware_volume(objs, st)
     if was is not None:
-        core.warn(f"hardware sink pinned to 100% (was {was:.0%}); "
-                  f"set your level with the desktop slider")
+        # The level found on the hardware sink is the level Pure was using -
+        # nothing else writes there. Remember it as Pure's own, so returning
+        # to Pure lands where the listener left it instead of at the pinned
+        # maximum. Per-mode memory, not cross-mode transfer: no arithmetic
+        # between stages, no path dependence - the one-way street that made
+        # yesterday's fold/restore machinery collapse stays closed.
+        st["pure_level"] = round(was, 3)
+        core.warn(f"hardware pinned to 100%; Pure will return at {was:.0%}")
 
     cid = control_node_id(objs)
-    spatial_ok = st.get("sofa") and core.sofa_works(objs)
+    spatial_ok = st.get("sofa") and spatial_ready(objs)
     if mode == MODE_SPATIAL and not spatial_ok:
         core.die("spatial unavailable: no SOFA file loaded")
 
@@ -393,6 +403,7 @@ def set_mode(mode, makeup=0.5, fade_ms=120, device=None):
     st["mode"] = mode
     push_many(cid, eq_values(bands_for(st, mode)))
     core.save_state(st)
+    _notify(mode)
     return f"{mode} (in-graph, EQ curve for {mode})"
 
 
@@ -459,6 +470,22 @@ def monitor(on_change):
 
 # ------------------------------------------------------------------ commands
 
+def spatial_ready(objs=None):
+    """
+    Did OUR graph's spatial path actually build?
+
+    The old check looked for any node named "spatializer" - which matched a
+    stray leftover config, not our graph. Removing that stray revealed the
+    dependency: spatial "support" vanished while the spatial path kept
+    working, because the check had been detecting the wrong object all
+    along. The spatial mixer's gain controls only exist on the unified sink
+    when its SOFA nodes loaded, so their presence is the question actually
+    being asked.
+    """
+    objs = objs or core.pw_dump()
+    return core.find_control_node(objs, "mixSpL:Gain") is not None
+
+
 def cmd_install(args):
     st = core.load_state()
     if args.sofa:
@@ -514,7 +541,7 @@ def cmd_install(args):
                  "journalctl --user -u pipewire -n 50")
     print("sink 'Headphones' is up")
     if st.get("sofa"):
-        print("spatial:", "available" if core.sofa_works(objs) else "SOFA FAILED")
+        print("spatial:", "available" if spatial_ready(objs) else "SOFA FAILED")
     return 0
 
 
@@ -530,7 +557,7 @@ def cmd_status(args):
     print(f"sofa           {st.get('sofa', '(none)')}")
     if nid:
         print(f"spatial        "
-              f"{'ok' if core.sofa_works(objs) else 'unavailable'}")
+              f"{'ok' if spatial_ready(objs) else 'unavailable'}")
     return 0
 
 
@@ -568,7 +595,7 @@ def cmd_cycle(args):
     """
     st = core.load_state()
     order = [MODE_EQ, MODE_SPATIAL, MODE_PURE]
-    if not (st.get("sofa") and core.sofa_works()):
+    if not (st.get("sofa") and spatial_ready()):
         order.remove(MODE_SPATIAL)
     try:
         nxt = order[(order.index(st.get("mode", MODE_EQ)) + 1) % len(order)]
@@ -576,8 +603,6 @@ def cmd_cycle(args):
         nxt = order[0]
     msg = set_mode(nxt, makeup=st.get("makeup", 0.5), fade_ms=120)
     print(msg)
-    core.run(["notify-send", "-t", "1200", "-i", "audio-headphones",
-              "Headphones", nxt.capitalize()])
     return 0
 
 
@@ -703,6 +728,23 @@ def cmd_sync(args):
 
     monitor(on_event)
     return 0
+
+
+_MODE_TITLES = {MODE_EQ: "Custom EQ", MODE_SPATIAL: "Spatial", MODE_PURE: "Pure"}
+
+
+def _notify(mode):
+    """
+    Flash the mode on screen at every switch.
+
+    The unified sink means the desktop's device label can never say which
+    mode is active - node.description is fixed at sink creation, and the
+    rebuild a rename requires is exactly the device churn the design exists
+    to avoid. A transient notification is the honest alternative: the name
+    stays stable, the switch is still visible, whoever made it.
+    """
+    core.run(["notify-send", "-t", "1500", "-i", "audio-headphones",
+              "Headphones", _MODE_TITLES.get(mode, mode)])
 
 
 def set_default_both_layers(node_id, node_name):
