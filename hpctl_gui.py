@@ -22,7 +22,7 @@ try:
     import gi
     gi.require_version("Gtk", "4.0")
     gi.require_version("Adw", "1")
-    from gi.repository import Gtk, Adw, GLib, Gio
+    from gi.repository import Gtk, Adw, GLib, Gio, Gdk
 except (ImportError, ValueError) as e:
     print(f"error: missing GTK4/libadwaita bindings ({e})", file=sys.stderr)
     print("Fedora/Bazzite: rpm-ostree install python3-gobject gtk4 libadwaita",
@@ -798,8 +798,35 @@ class App(Adw.Application):
         super().__init__(application_id="org.hpctl.Headphones")
 
     def do_activate(self):
+        self._widen_scrollbars()
         win = self.props.active_window or Window(self)
         win.present()
+
+    def _widen_scrollbars(self):
+        """
+        GTK4's default overlay scrollbars are a few pixels wide - fine for a
+        document you rarely scroll, tedious in a settings panel you scrub
+        through constantly. Widen the slider and keep it that size on hover
+        so it is a target you aim at once, not twice.
+        """
+        css = Gtk.CssProvider()
+        css.load_from_data(b"""
+            scrollbar slider {
+                min-width: 12px;
+                min-height: 12px;
+                border-radius: 6px;
+            }
+            scrollbar.horizontal slider { min-height: 12px; }
+            scrollbar.vertical slider   { min-width: 12px; }
+            scrollbar:hover slider {
+                min-width: 14px;
+                min-height: 14px;
+            }
+        """)
+        display = Gdk.Display.get_default()
+        if display is not None:
+            Gtk.StyleContext.add_provider_for_display(
+                display, css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
 
 if __name__ == "__main__":
