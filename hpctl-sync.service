@@ -3,14 +3,14 @@ Description=hpctl hardware volume pin
 After=pipewire.service wireplumber.service
 Wants=pipewire.service
 PartOf=pipewire.service
+StartLimitBurst=3
+StartLimitIntervalSec=60
 
 [Service]
 Type=simple
 ExecStart=/usr/bin/python3 %h/hpctl/hpctl3.py pin
 Restart=on-failure
 RestartSec=3
-StartLimitBurst=3
-StartLimitIntervalSec=60
 
 [Install]
 WantedBy=default.target
