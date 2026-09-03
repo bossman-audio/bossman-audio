@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Bossman Audio
+Comment=Headphone and speaker audio control
+Exec=python3 /home/bossman/hpctl/hpctl_gui.py
+Icon=audio-headphones
+Terminal=false
+Categories=AudioVideo;Audio;
