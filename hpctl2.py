@@ -407,6 +407,9 @@ def load_state():
             s.setdefault("mode", "pure")
             s.setdefault("hw_sink", "")
             s.setdefault("sofa", "")
+            import profiles
+            if profiles.migrate(s):
+                save_state(s)
             return s
         except (json.JSONDecodeError, OSError):
             pass

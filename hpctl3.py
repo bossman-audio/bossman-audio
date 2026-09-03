@@ -38,7 +38,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-
+import profiles
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 try:
@@ -289,8 +289,6 @@ def set_volume(node_id, vol):
 
 def pin_hardware_volume(objs, st, chain_id=None):
     """
-    Hold the hardware sink at unity while the chain is active. Nothing more.
-
     Earlier versions tried to be kind across mode switches: fold the hardware
     level into the chain on the way in, save it, restore it on the way out.
     Each rule was locally sensible and together they made loudness depend on
@@ -306,6 +304,8 @@ def pin_hardware_volume(objs, st, chain_id=None):
     hw = st.get("hw_sink")
     if not hw:
         return None
+    if not profiles.should_pin(st, hw):
+        return None
     nid = core.resolve(objs, hw)
     if nid is None:
         return None
@@ -314,7 +314,6 @@ def pin_hardware_volume(objs, st, chain_id=None):
         set_volume(nid, 1.0)
         return current
     return None
-
 
 def sink_node_id(objs=None):
     objs = objs or core.pw_dump()
